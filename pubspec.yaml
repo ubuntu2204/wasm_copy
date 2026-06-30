@@ -1,0 +1,34 @@
+name: wasm_copy
+description: >-
+  一个基于 Flutter WebAssembly 的示例应用，演示如何在 Web 端把本地图片
+  复制到剪贴板或通过系统分享面板发送到微信。内置 Clipboard API → Web Share
+  API → 下载三级降级策略，并提供完整的浏览器能力诊断 UI。
+publish_to: 'none'
+
+version: 1.0.0+1
+
+environment:
+  sdk: ^3.12.1
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  cupertino_icons: ^1.0.8
+
+  # 浏览器互操作（WASM 兼容），用于访问 Clipboard API 与 Web Share API。
+  web: ^1.1.1
+
+  # 纯 Dart 图像编解码，用于把 JPG 资源转码为 PNG（浏览器剪贴板仅接受 image/png）。
+  image: ^4.9.1
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^6.0.0
+
+flutter:
+  uses-material-design: true
+
+  assets:
+    - image/DA7D255646C02B32A7EF54A2798EF383.jpg
