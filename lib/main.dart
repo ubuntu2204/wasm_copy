@@ -608,15 +608,18 @@ class _MyHomePageState extends State<MyHomePage> {
           ),
         ],
       ),
-      body: Center(
-        child: Column(
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: <Widget>[
-            ClipRRect(
-              borderRadius: BorderRadius.circular(12),
-              child: Image.asset(_assetPath, width: 240),
-            ),
-            const SizedBox(height: 24),
+      body: SafeArea(
+        child: SingleChildScrollView(
+          padding: const EdgeInsets.symmetric(vertical: 16),
+          child: Center(
+            child: Column(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: <Widget>[
+                ClipRRect(
+                  borderRadius: BorderRadius.circular(12),
+                  child: Image.asset(_assetPath, width: 240),
+                ),
+                const SizedBox(height: 24),
             // 与图片一起复制的文字内容，用户可自行编辑。
             SizedBox(
               width: 320,
@@ -661,6 +664,8 @@ class _MyHomePageState extends State<MyHomePage> {
               style: Theme.of(context).textTheme.bodySmall,
             ),
           ],
+        ),
+      ),
         ),
       ),
     );
