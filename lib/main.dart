@@ -129,12 +129,34 @@ class _MyHomePageState extends State<MyHomePage> {
   /// 双类型时，Android 系统剪贴板与微信客户端协同存在缺陷，常见现象是
   /// 粘贴时只剩文字、图片丢失。因此在移动端直接跳过 Clipboard API，改走
   /// Web Share API（系统分享面板），这是手机上同时发图+文字最可靠的路径。
+  ///
+  /// **UA 伪装兜底**：夸克浏览器等内置「浏览器 UA 标识」切换功能，可一键
+  /// 把 UA 改成「Chrome 桌面版」。此时 UA 不再含 android/iphone，但设备
+  /// 本身仍是手机。若仅靠 UA 判断，会错误走桌面分支的 Clipboard API 双
+  /// 类型写入——Android 上图片被静默丢弃，只剩文字（即用户反馈的现象）。
+  /// 因此在 UA 检测之外，再用「主输入方式」做一层兜底：设备有触摸
+  /// （coarse pointer）且没有鼠标（fine pointer）时，也判定为移动端。
+  ///   • 纯触屏手机 → coarse=yes, fine=no → 命中
+  ///   • 触屏笔记本 → coarse=yes, fine=yes → 不命中（有鼠标）
+  ///   • 桌面台式机 → coarse=no,  fine=yes → 不命中
   bool _isMobile() {
     final ua = web.window.navigator.userAgent.toLowerCase();
-    return ua.contains('android') ||
+    if (ua.contains('android') ||
         ua.contains('iphone') ||
         ua.contains('ipad') ||
-        ua.contains('ipod');
+        ua.contains('ipod')) {
+      return true;
+    }
+    try {
+      if (web.window
+          .matchMedia('(any-pointer: coarse) and (not any-pointer: fine)')
+          .matches) {
+        return true;
+      }
+    } catch (_) {
+      // matchMedia 不可用或不支持该语法，忽略。
+    }
+    return false;
   }
 
   /// 诊断 Clipboard API 是否可用，返回 `null` 表示就绪，否则返回中文错误说明。
@@ -186,6 +208,67 @@ class _MyHomePageState extends State<MyHomePage> {
     return null; // 一切就绪
   }
 
+  /// 把文字复制到剪贴板，依次尝试多种方法。
+  ///
+  /// 调用顺序：
+  /// 1. **异步 Clipboard API** (`navigator.clipboard.writeText`) —— 标准、
+  ///    跨平台，但需要 `clipboard-write` 权限。夸克浏览器等即使在安全
+  ///    上下文下也会拒绝权限，抛 `NotAllowedError: Write permission denied`。
+  /// 2. **`document.execCommand('copy')` + 隐藏 textarea** —— 旧版 API，
+  ///    权限模型不同，只需在用户手势上下文中调用即可。在夸克等拒绝
+  ///    Clipboard API 的浏览器上仍可工作。
+  ///
+  /// 返回 `true` 表示任一方法成功。
+  Future<bool> _copyText(String text) async {
+    // 方法 1：异步 Clipboard API
+    try {
+      await web.window.navigator.clipboard.writeText(text).toDart;
+      return true;
+    } catch (_) {
+      // 夸克等浏览器在这里抛 NotAllowedError，继续降级
+    }
+
+    // 方法 2：execCommand('copy') 兜底
+    return _legacyCopyText(text);
+  }
+
+  /// 用隐藏 textarea + `document.execCommand('copy')` 复制文字。
+  ///
+  /// 这是 Clipboard API 普及前的经典方案。权限模型只要求用户手势上下文，
+  /// 不需要显式 `clipboard-write` 权限，因此在夸克等浏览器上仍可工作。
+  ///
+  /// 注意：必须在用户手势上下文中调用，否则 `execCommand` 会返回
+  /// `false` 而不报错。`await navigator.clipboard.writeText` 失败后的
+  /// 微任务 continuation 中仍处于 transient activation 窗口（5 秒），
+  /// 可以正常工作。
+  bool _legacyCopyText(String text) {
+    final doc = web.document;
+    final body = doc.body;
+    if (body == null) return false;
+    final textarea = doc.createElement('textarea') as web.HTMLTextAreaElement;
+    try {
+      textarea.value = text;
+      // readonly 避免在移动端弹出软键盘
+      textarea.setAttribute('readonly', '');
+      final style = textarea.style;
+      style.position = 'fixed';
+      style.left = '-9999px';
+      style.top = '0';
+      // 防止 iOS Safari 自动缩放
+      style.fontSize = '16px';
+      body.appendChild(textarea);
+      textarea.focus();
+      textarea.select();
+      // 部分移动浏览器（特别是 iOS）需要 setSelectionRange 才能真正选中
+      textarea.setSelectionRange(0, text.length);
+      return doc.execCommand('copy');
+    } catch (_) {
+      return false;
+    } finally {
+      textarea.remove();
+    }
+  }
+
   /// 用户点击主按钮的入口，按三级降级策略执行：剪贴板 → 系统分享 → 下载。
   ///
   /// 任何一级成功后立即 `return`；失败则继续尝试下一级，并用 SnackBar 实时
@@ -231,29 +314,26 @@ class _MyHomePageState extends State<MyHomePage> {
       final nav = web.window.navigator as JSObject;
       final hasShare = nav.has('share') && nav.has('canShare');
       if (hasShare && _canShareFile(pngBytes)) {
-        try {
-          final file = web.File(
-            [pngBytes.toJS].toJS,
-            'image.png',
-            web.FilePropertyBag(type: 'image/png'),
-          );
-          final shareData = web.ShareData(
-            title: '分享图片',
-            text: '来自 wasm_copy 的图片',
-            files: [file].toJS,
-          );
-          await web.window.navigator.share(shareData).toDart;
+        final file = web.File(
+          [pngBytes.toJS].toJS,
+          'image.png',
+          web.FilePropertyBag(type: 'image/png'),
+        );
+        final shareData = web.ShareData(
+          title: '分享图片',
+          text: '来自 wasm_copy 的图片',
+          files: [file].toJS,
+        );
+        final result = await _callShare(shareData);
+        if (result == 'success') {
           _toast('✅ 已通过系统分享发送');
           return;
-        } catch (e) {
-          // 用户主动取消（AbortError）不算失败。
-          final s = e.toString();
-          if (s.contains('AbortError') || s.contains('abort')) {
-            return;
-          }
-          _toast('系统分享失败（$e），尝试下载…',
-              duration: const Duration(seconds: 3));
         }
+        if (result == 'cancelled') {
+          return; // 用户主动取消，不再走兜底
+        }
+        // failed：浏览器未拉起分享面板（夸克等），继续走下载兜底。
+        _toast('系统分享未拉起，尝试下载…', duration: const Duration(seconds: 3));
       }
 
       // === 3. 兜底：触发浏览器下载 ===
@@ -274,23 +354,32 @@ class _MyHomePageState extends State<MyHomePage> {
   ///   1. **Clipboard API** —— 单个 [web.ClipboardItem] 同时包含 `text/plain`
   ///      和 `image/png` 两种类型，写入系统剪贴板。微信桌面端粘贴时会取
   ///      图片，文字可粘到纯文本输入框。
-  ///   2. 失败则降级到 Web Share API。
-  ///   3. 兜底：复制文字 + 下载图片。
+  ///   2. 失败则降级：[_copyText] 复制文字 + [_shareImageOnly] 分享图片。
+  ///   3. 兜底：[_copyText] 复制文字 + 下载图片；若文字也复制失败，弹窗
+  ///      让用户长按手动复制。
   ///
   /// **移动端**（Android/iOS Chrome/Safari）：
-  ///   1. **Web Share API + 剪贴板文字** —— Android Chrome 调用
+  ///   1. **[_copyText] + Web Share API** —— Android Chrome 调用
   ///      `navigator.share({text, files})` 时微信会丢弃 `text` 字段，
-  ///      因此本方法改为：先把文字 `clipboard.writeText` 写入剪贴板，
-  ///      再 `navigator.share({files: [image]})` 只分享图片。用户在微信
-  ///      粘贴图片后，再粘贴一次剪贴板里的文字。
+  ///      因此改为：先用 [_copyText] 把文字写入剪贴板（多种方法兜底），
+  ///      再 `navigator.share({files: [image]})` 只分享图片。
   ///      ⚠️ 不走 Clipboard API 双类型的原因：手机 Chrome 写入双类型
   ///      `ClipboardItem` 时，Android 系统剪贴板与微信客户端协同存在
   ///      缺陷，常见现象是粘贴时只剩文字、图片丢失。
   ///      ⚠️ 必须使用 [_cachedPngBytes] 预缓存：Android Chrome 要求
-  ///      `navigator.share()` 在用户手势同步上下文中执行，任何 `await`
-  ///      都会丢失手势并抛 `NotAllowedError`。`writeText` 是快速操作，
-  ///      在 5 秒 transient activation 窗口内，不影响后续 `share()`。
-  ///   2. 兜底：复制文字到剪贴板 + 下载图片。
+  ///      `navigator.share()` 在用户手势同步上下文中执行，任何耗时
+  ///      `await` 都会丢失手势并抛 `NotAllowedError`。[_copyText] 内部
+  ///      只做快速操作（writeText 失败后立即同步 execCommand），仍在
+  ///      5 秒 transient activation 窗口内，不影响后续 `share()`。
+  ///   2. 兜底：[_copyText] 复制文字 + 下载图片；若文字也复制失败，
+  ///      弹窗让用户长按手动复制。
+  ///
+  /// **夸克浏览器等特殊场景**：夸克暴露 Clipboard API 但运行时拒绝
+  /// `writeText` 权限（抛 `NotAllowedError: Write permission denied`），
+  /// 同时 `canShare` 误报 `true` 但 `share` 不拉起面板。本方法通过
+  /// [_copyText] 内部的 `document.execCommand('copy')` 兜底来绕过
+  /// Clipboard API 权限限制；若 execCommand 也失败，弹窗让用户长按
+  /// 手动复制文字，至少保证图片能下载。
   Future<void> _copyImageAndText() async {
     setState(() => _busy = true);
     try {
@@ -298,40 +387,48 @@ class _MyHomePageState extends State<MyHomePage> {
       final text = _textController.text.isEmpty ? ' ' : _textController.text;
 
       if (_isMobile()) {
-        // === 移动端：直接 Web Share API ===
-        // 关键：不能在这里 await 任何东西，否则 Android Chrome 丢失
-        // user gesture context，share() 抛 NotAllowedError。必须使用
+        // === 移动端 ===
+        // 关键：不能在 share() 之前 await 任何耗时操作，否则 Android Chrome
+        // 丢失 user gesture context，share() 抛 NotAllowedError。必须使用
         // initState 中预缓存的 PNG 字节。
         final pngBytes = _cachedPngBytes;
         if (pngBytes == null) {
           // 极少数情况：用户在预加载完成前就点击。share 路径必失败，
-          // 直接走下载兜底；文字走 writeText（桌面端权限模型较宽松，
-          // 这里手机端可能也会失败，但没更好的选择）。
+          // 直接走下载兜底；文字走 [_copyText]（多种方法）。
           final freshBytes = await _loadPngBytes();
           _downloadPng(freshBytes);
-          try {
-            await web.window.navigator.clipboard.writeText(text).toDart;
+          final textCopied = await _copyText(text);
+          if (textCopied) {
             _toast('图片预加载未完成，已下载图片；文字已复制');
-          } catch (e) {
-            _toast('图片预加载未完成，已下载图片；文字复制失败：$e');
+          } else {
+            _toast('图片预加载未完成，已下载图片；文字复制失败');
+            _showTextFallbackDialog(text);
           }
           return;
         }
 
-        // share 路径：_shareImageAndText 是 async，但其函数体在第一次
-        // await（即 navigator.share() 调用）前是同步执行的，因此 share()
-        // 仍在用户手势上下文中被调用。
-        final shareOK = await _shareImageAndText(pngBytes, text);
-        if (shareOK) return;
+        // 1. 先复制文字（多种方法兜底，应对夸克等拒绝 Clipboard API 的浏览器）
+        final textCopied = await _copyText(text);
 
-        // 兜底：复制文字 + 下载图片
-        try {
-          await web.window.navigator.clipboard.writeText(text).toDart;
-          _downloadPng(pngBytes);
+        // 2. 再分享图片（不带 text，避免被微信丢弃）
+        final shareOK = await _shareImageOnly(pngBytes);
+        if (shareOK) {
+          if (textCopied) {
+            _toast('✅ 图片已分享；文字已复制到剪贴板\n可在微信对话框直接粘贴');
+          } else {
+            _toast('✅ 图片已分享；文字复制失败，请手输');
+          }
+          return;
+        }
+
+        // 3. 分享也失败（夸克等），下载图片；文字若没复制成功，弹窗手动复制
+        _downloadPng(pngBytes);
+        if (textCopied) {
           _toast('文字已复制到剪贴板，图片已下载');
-        } catch (e) {
-          _downloadPng(pngBytes);
-          _toast('图片已下载；文字复制失败：$e');
+        } else {
+          _toast('图片已下载；文字复制失败，请长按下方文字手动复制',
+              duration: const Duration(seconds: 3));
+          _showTextFallbackDialog(text);
         }
         return;
       }
@@ -361,24 +458,30 @@ class _MyHomePageState extends State<MyHomePage> {
               '微信粘贴通常只取图片，发文字请粘到纯文本输入框');
           return;
         } catch (e) {
-          _toast('剪贴板写入失败（$e），尝试系统分享…',
+          _toast('剪贴板写入失败（$e），尝试其他方式…',
               duration: const Duration(seconds: 3));
         }
       } else {
         _toast('剪贴板不可用，切换到分享模式…', duration: const Duration(seconds: 2));
       }
 
-      // 桌面端降级：Web Share API
-      if (await _shareImageAndText(pngBytes, text)) return;
+      // 桌面端降级：复制文字 + 分享图片
+      final textCopied = await _copyText(text);
+      if (await _shareImageOnly(pngBytes)) {
+        _toast(textCopied
+            ? '✅ 图片已分享；文字已复制到剪贴板'
+            : '✅ 图片已分享；文字复制失败');
+        return;
+      }
 
-      // 兜底：复制文字 + 下载图片
-      try {
-        await web.window.navigator.clipboard.writeText(text).toDart;
-        _downloadPng(pngBytes);
+      // 兜底：下载图片 + 复制文字
+      _downloadPng(pngBytes);
+      if (textCopied) {
         _toast('文字已复制到剪贴板，图片已下载');
-      } catch (e) {
-        _downloadPng(pngBytes);
-        _toast('图片已下载；文字复制失败：$e');
+      } else {
+        _toast('图片已下载；文字复制失败，请长按下方文字手动复制',
+            duration: const Duration(seconds: 3));
+        _showTextFallbackDialog(text);
       }
     } catch (e, st) {
       _showErrorDialog('复制图片和文字失败', e, st);
@@ -387,66 +490,71 @@ class _MyHomePageState extends State<MyHomePage> {
     }
   }
 
-  /// 调用 `navigator.share({files})` 分享图片，同时把文字预先写入剪贴板。
+  /// 调用 `navigator.share({files})` 仅分享图片。
   ///
-  /// 返回 `true` 表示分享流程已完成（成功或用户取消）；`false` 表示当前
-  /// 环境不支持，调用方应继续走兜底逻辑。
+  /// 返回 `true` 表示分享已完成（成功或用户取消）；`false` 表示当前
+  /// 环境不支持，或浏览器未拉起分享面板，调用方应继续走兜底逻辑。
   ///
   /// **设计原因**：Android Chrome 调用 `navigator.share({text, files})`
   /// 同时传文件和文字时，微信的 share intent 只接收图片、丢弃 `text`
-  /// 字段，导致文字无法送达。改为：
-  ///   1. 调用 `clipboard.writeText(text)` 把文字写入系统剪贴板；
-  ///   2. 调用 `navigator.share({files: [image]})` 仅分享图片；
-  ///   3. 用户在微信对话框粘贴图片后，再粘贴一次剪贴板里的文字。
-  ///
-  /// `writeText` 的 transient activation 窗口是 5 秒，远大于其执行时间，
-  /// 因此后续 `share()` 调用仍处于用户手势激活状态，不会触发 NotAllowedError。
-  Future<bool> _shareImageAndText(Uint8List pngBytes, String text) async {
+  /// 字段，导致文字无法送达。因此本方法只分享图片，文字由调用方通过
+  /// [_copyText] 单独写入剪贴板。
+  Future<bool> _shareImageOnly(Uint8List pngBytes) async {
     final nav = web.window.navigator as JSObject;
     final hasShare = nav.has('share') && nav.has('canShare');
     if (!hasShare || !_canShareFile(pngBytes)) {
       return false;
     }
 
-    // 1. 先把文字写入剪贴板。失败不阻塞分享，只是提示用户手输。
-    bool textCopied = false;
-    try {
-      await web.window.navigator.clipboard.writeText(text).toDart;
-      textCopied = true;
-    } catch (_) {
-      // 静默失败，分享仍可继续。
-    }
-
-    // 2. 分享图片（不带 text，避免被微信丢弃）。
-    try {
-      final file = web.File(
-        [pngBytes.toJS].toJS,
-        'image.png',
-        web.FilePropertyBag(type: 'image/png'),
-      );
-      final shareData = web.ShareData(
-        title: '分享图片',
-        files: [file].toJS,
-      );
-      await web.window.navigator.share(shareData).toDart;
-      if (textCopied) {
-        _toast('✅ 图片已分享；文字已复制到剪贴板\n可在微信对话框直接粘贴');
-      } else {
-        _toast('✅ 图片已分享；文字复制失败，请手输');
-      }
+    final file = web.File(
+      [pngBytes.toJS].toJS,
+      'image.png',
+      web.FilePropertyBag(type: 'image/png'),
+    );
+    final shareData = web.ShareData(
+      title: '分享图片',
+      files: [file].toJS,
+    );
+    final result = await _callShare(shareData);
+    if (result == 'success') {
       return true;
+    }
+    if (result == 'cancelled') {
+      return true; // 用户主动取消，视为已完成
+    }
+    // failed：浏览器未拉起分享面板（夸克等），调用方继续走兜底。
+    _toast('系统分享未拉起，尝试下载…', duration: const Duration(seconds: 3));
+    return false;
+  }
+
+  /// 调用 `navigator.share(data)` 并对异常做精细化分类。
+  ///
+  /// 返回值：
+  /// - `'success'` —— 分享成功 resolve。
+  /// - `'cancelled'` —— 用户在系统分享面板里主动取消（典型表现：share()
+  ///   调用数百毫秒甚至数秒后才 reject `AbortError`，期间用户能看到面板）。
+  /// - `'failed'` —— 分享未拉起 UI 就直接失败，或抛出非 Abort 异常。调用方
+  ///   应继续走兜底。
+  ///
+  /// **为什么需要时间差判断**：夸克等浏览器对 `navigator.share({files})`
+  /// 不真正支持，但 `canShare` 误报 `true`。调用 `share()` 后会立即
+  /// reject `AbortError` 而不拉起任何 UI。如果按"AbortError = 用户取消"
+  /// 处理，就会错误地停止后续兜底（用户实际现象：提示"已取消分享"，
+  /// 但根本没看到分享面板）。这里用 200ms 阈值区分：用户主动取消至少
+  /// 有数百毫秒 UI 交互时间，浏览器拒绝拉起通常是同步或几十毫秒内 reject。
+  Future<String> _callShare(web.ShareData data) async {
+    final sw = Stopwatch()..start();
+    try {
+      await web.window.navigator.share(data).toDart;
+      return 'success';
     } catch (e) {
+      final elapsed = sw.elapsedMilliseconds;
       final s = e.toString();
-      if (s.contains('AbortError') || s.contains('abort')) {
-        // 用户取消分享，但文字可能已写入剪贴板，提示一下。
-        if (textCopied) {
-          _toast('已取消分享；文字已复制到剪贴板');
-        }
-        return true; // 视为已完成，不再走兜底
+      final isAbort = s.contains('AbortError') || s.contains('abort');
+      if (isAbort && elapsed > 200) {
+        return 'cancelled';
       }
-      _toast('系统分享失败（$e），尝试下载…',
-          duration: const Duration(seconds: 3));
-      return false;
+      return 'failed';
     }
   }
 
@@ -490,6 +598,46 @@ class _MyHomePageState extends State<MyHomePage> {
     if (!mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(content: Text(msg), duration: duration),
+    );
+  }
+
+  /// 弹窗展示文字内容，供用户长按手动复制。
+  ///
+  /// 当所有自动复制方案都失败时（如夸克浏览器禁用 `clipboard-write`
+  /// 权限且 `execCommand('copy')` 也被禁用），这是最后的兜底。图片仍
+  /// 通过下载方式给到用户，文字至少能在对话框里被选中复制。
+  void _showTextFallbackDialog(String text) {
+    if (!mounted) return;
+    showDialog<void>(
+      context: context,
+      builder: (_) => AlertDialog(
+        title: const Text('请手动复制文字'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text('自动复制到剪贴板失败。请长按下方文字，选择「复制」：'),
+            const SizedBox(height: 12),
+            Container(
+              padding: const EdgeInsets.all(12),
+              decoration: BoxDecoration(
+                color: Colors.grey.shade100,
+                borderRadius: BorderRadius.circular(8),
+              ),
+              child: SelectableText(
+                text,
+                style: const TextStyle(fontSize: 15),
+              ),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(),
+            child: const Text('关闭'),
+          ),
+        ],
+      ),
     );
   }
 
@@ -572,19 +720,37 @@ class _MyHomePageState extends State<MyHomePage> {
     buf.writeln('=== 诊断结论 ===');
     final issue = _diagnoseClipboard();
     buf.writeln(issue ?? '剪贴板 API 就绪，可直接复制。');
+    buf.writeln();
+    buf.writeln('注：即使 API 就绪，部分浏览器（如夸克）仍可能在运行时'
+        '拒绝 writeText 权限。\n本应用已加 execCommand+手动复制两层兜底。');
 
     if (!mounted) return;
+    final diagText = buf.toString();
+    final messenger = ScaffoldMessenger.of(context);
     await showDialog<void>(
       context: context,
       builder: (_) => AlertDialog(
         title: const Text('诊断信息'),
         content: SingleChildScrollView(
           child: Text(
-            buf.toString(),
+            diagText,
             style: const TextStyle(fontFamily: 'monospace', fontSize: 12),
           ),
         ),
         actions: [
+          TextButton.icon(
+            icon: const Icon(Icons.copy, size: 18),
+            label: const Text('复制'),
+            onPressed: () async {
+              try {
+                await Clipboard.setData(ClipboardData(text: diagText));
+                messenger
+                    .showSnackBar(const SnackBar(content: Text('诊断信息已复制到剪贴板')));
+              } catch (e) {
+                messenger.showSnackBar(SnackBar(content: Text('复制失败：$e')));
+              }
+            },
+          ),
           TextButton(
             onPressed: () => Navigator.of(context).pop(),
             child: const Text('关闭'),
